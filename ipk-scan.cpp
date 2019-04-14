@@ -2,7 +2,7 @@
  * Printing help message
  */
 
-// #include "ipk-scan.h"
+#include "ipk-scan.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -18,6 +18,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
 #include <netdb.h>
 #include <net/if.h>
 
@@ -38,6 +39,9 @@
 #define ERROR_PARAMS 200
 
 #define IP_HL(ip)               (((ip)->ihl) & 0x0f)
+
+#define TCP_PROTOCOL 6
+#define UDP_PROTOCOL 17
 
 struct tcp_pseudo_header {
 
@@ -170,7 +174,12 @@ queue<int> parse_ports(string ports){
 
   // case of ports range
   if(ports.find("-") != string::npos){
-    ;
+    int first_port = stoi(ports.substr(0, ports.find("-")));
+    int last_port = stoi(ports.substr(ports.find("-") + 1)) ;
+
+    for (; first_port <= last_port; first_port++){
+      s_ports.push(first_port);
+    }
   }
   // comma separated values
   else if(ports.find(",") != string::npos){
@@ -237,17 +246,18 @@ string get_interface_ip(string interface_name){
   return ip_address;
 }
 
-// void create_udp_packet(udphdr * udp, int s_port, int dest_port){
-//
-//   udp->source = s_port; /* source port */
-//   udp->dest = dest_port; /* destination port */
-//   udp->len = htons(sizeof(udphdr)); /* udp length */
-//   udp->uh_sum = 0; /* udp checksum */
-// }
+void create_udp_packet(struct udphdr *udp, int dest_port){
+
+  udp->source = htons(60035); /* source port */
+  udp->dest = htons(dest_port); /* destination port */
+  udp->len = htons(sizeof(udphdr)); /* udp length */
+  udp->uh_sum = 0; /* udp checksum */
+
+}
 
 
 void create_tcp_header(struct tcphdr *tcp, struct iphdr *ip, int dest_port){
-  tcp->source = htons(60358);
+  tcp->source = htons(60036);
   tcp->dest = htons(dest_port);
   tcp->seq = 0;
   tcp->ack_seq = 0;
@@ -265,26 +275,43 @@ void create_tcp_header(struct tcphdr *tcp, struct iphdr *ip, int dest_port){
   tcp->check = generate_tcp_checksum(ip, tcp, (ip->tot_len-(ip->ihl*4)));
 }
 
-void create_ip_header(struct tcphdr *tcp ,struct iphdr *ip, string dest_ip, string source_ip){
+void create_ip_header(struct iphdr *ip, string dest_ip, string source_ip, int protocol){
 
   ip->ihl = 5;
   ip->version = 4;
   ip->tos = 16;
-  ip->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr);
+  if(protocol == TCP_PROTOCOL){
+    ip->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr);
+  }
+  else {
+    ip->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr);
+  }
   ip->id = htons(54321);
   ip->frag_off = 0;
   ip->ttl = 64;
-  ip->protocol = 6; // TCP
+  ip->protocol = protocol;
   ip->check = 0; // Done by kernel
   ip->saddr = inet_addr(source_ip.c_str());
   ip->daddr = inet_addr(dest_ip.c_str());
 }
 
-int pcap_set_new_filter(pcap_t *handle, bpf_program fp, bpf_u_int32 mask, bpf_u_int32 net, int port_numb){
+int pcap_set_new_filter(char* dev, bpf_program fp, bpf_u_int32 mask, bpf_u_int32 net, string filter){
+
+  char errbuffer[100];
+  handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuffer);
+  if(handle == NULL){
+    fprintf(stderr, "ERROR : SNIFFING : An error occured in function pcap_open_live(). Couldn't open device: %s %s\n", dev, errbuffer);
+    return(-1);
+  }
+
+  if(pcap_datalink(handle) != DLT_EN10MB) {
+    fprintf(stderr, "ERROR : INTERFACE : Device %s doesn't provide Ethernet headers - not supported\n", dev);
+    return(-1);
+  }
 
   char pcap_filter[100];
-  string t_fp = "port " + to_string(port_numb);
-  strcpy(pcap_filter, t_fp.c_str());
+  // string t_fp = "port " + filter;
+  strcpy(pcap_filter, filter.c_str());
   // char fltr[] = "port 60358"; /*  Source port of our application  */
 
   if (pcap_compile(handle, &fp, pcap_filter, 0, net) == -1) {
@@ -298,21 +325,80 @@ int pcap_set_new_filter(pcap_t *handle, bpf_program fp, bpf_u_int32 mask, bpf_u_
   return 0;
 }
 
-// void handle_packets(u_char *useless, const struct pcap_pkthdr* header, const u_char* packet){
-//   const struct iphdr *ip_sniff;
-//   ip_sniff = (struct iphdr*)(packet + 14);
-//   int ip_size = IP_HL(ip_sniff)*4;
-//   if(ip_sniff->protocol == IPPROTO_TCP){
-//     printf("YE\n");
-//   }
-//
-// }
+void alarm_handler(int sig) {
+
+  pcap_breakloop(handle);
+  cout << "open" << endl;
+}
+
+void tcp_alarm_handler(int sig){
+
+  pcap_breakloop(handle);
+  cout << "filtered" << endl;
+}
+
+void packet_handle_udp(u_char *args, const struct pcap_pkthdr *header, const u_char *packet){
+
+
+  const struct iphdr *ip_sniff;
+  ip_sniff = (struct iphdr*)(packet + 14);
+  int ip_size = IP_HL(ip_sniff)*4;
+  // int alarm_time = 1;
+
+  if(ip_sniff->protocol == 1){
+
+    const struct icmp *icmp_sniff;
+    icmp_sniff = (struct icmp*)(packet + 14 + ip_size);
+
+    if (icmp_sniff->icmp_type == 3){
+      cout << "closed" << endl;
+      alarm(0); /* Destroy current alarm */
+
+    }
+  }
+  else {
+    fprintf(stderr, "ERROR : Unexpected protocol detected, protocol number:  %d\n", ip_sniff->protocol);
+  }
+  // alarm(1);
+  // signal(SIGALRM, alarm_handler);
+
+}
+
+void packet_handle_tcp(u_char *args, const struct pcap_pkthdr *header, const u_char *packet){
+
+  const struct iphdr *ip_sniff;
+  ip_sniff = (struct iphdr*)(packet + 14);
+  int ip_size = IP_HL(ip_sniff)*4;
+
+  if(ip_sniff->protocol == IPPROTO_TCP){
+
+    const struct tcphdr *tcp_sniff;
+    tcp_sniff = (struct tcphdr*)(packet + 14 + ip_size);
+
+
+    if(tcp_sniff->ack && tcp_sniff->syn) {
+      cout << "open" << endl;
+    }
+    else if (tcp_sniff->ack && tcp_sniff->rst) {
+      cout << "closed" << endl;
+    }
+    else {
+      if(tcp_sniff->syn){;} // SYN packet from scanner -> ignore
+      else {
+        printf("NO %d %d %d %d \n",tcp_sniff->ack, tcp_sniff->syn, tcp_sniff->fin, tcp_sniff->rst );
+      }
+    }
+  }
+  else {
+    fprintf(stderr, "ERROR : Unexpected protocol detected, protocol number:  %d\n", ip_sniff->protocol);
+  }
+}
 
 int main(int argc, char **argv) {
 
   string domain_name = "", ip_addr = "", tcp_ports = "", udp_ports = "", host_name = "";
   queue<int> q_tcp_ports;
-  queue<int> s_udp_ports;
+  queue<int> q_udp_ports;
 
   int s_socket = 0;
   char *buffer = new char[8192]();
@@ -324,7 +410,7 @@ int main(int argc, char **argv) {
 
   char *dev, errbuffer[100];  /*  Interface name and error buffer for pcap  */
   // char pcap_filter[100];
-  pcap_t *handle;
+  //pcap_t *handle;
   struct bpf_program fp;
   bpf_u_int32 mask;		/* Our netmask */
 	bpf_u_int32 net;		/* Our IP */
@@ -400,7 +486,7 @@ int main(int argc, char **argv) {
 
   /*  Parsed tcp and udp ports in queues  */
   q_tcp_ports = parse_ports(tcp_ports);
-  s_udp_ports = parse_ports(udp_ports);
+  q_udp_ports = parse_ports(udp_ports);
 
 /*************  Create pcap filter and prepare filtering  *********************/
 
@@ -425,21 +511,21 @@ int main(int argc, char **argv) {
 
   /*  Open device for sniffing  */
   // set 1 -> 0 for non-promiscuous
-  handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuffer);
-  if(handle == NULL){
-    fprintf(stderr, "ERROR : SNIFFING : An error occured in function pcap_open_live(). Couldn't open device: %s %s\n", dev, errbuffer);
-		return(-1);
-  }
-
-  if(pcap_datalink(handle) != DLT_EN10MB) {
-    fprintf(stderr, "ERROR : INTERFACE : Device %s doesn't provide Ethernet headers - not supported\n", dev);
-    return(-1);
-  }
+  // handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuffer);
+  // if(handle == NULL){
+  //   fprintf(stderr, "ERROR : SNIFFING : An error occured in function pcap_open_live(). Couldn't open device: %s %s\n", dev, errbuffer);
+	// 	return(-1);
+  // }
+  //
+  // if(pcap_datalink(handle) != DLT_EN10MB) {
+  //   fprintf(stderr, "ERROR : INTERFACE : Device %s doesn't provide Ethernet headers - not supported\n", dev);
+  //   return(-1);
+  // }
 
   // string t_fp = "port " + to_string(port_numb);
   // strcpy(pcap_filter, t_fp.c_str());
 
-  pcap_set_new_filter(handle, fp, mask, net, 60358);
+
   // char fltr[] = "port 60358"; /*  Source port of our application  */
   //
   // if (pcap_compile(handle, &fp, fltr, 0, net) == -1) {
@@ -487,13 +573,60 @@ int main(int argc, char **argv) {
   // memcpy(&sin.sin_addr, dest->h_addr, dest->h_length);
 
   cout << endl << "Interesting ports on " << domain_name << " (" << stri <<"):" << endl;
-  cout << "PORT   " << "    STATE" << endl;
+  cout << "PORT     STATE " << endl;
 
+/********************** Create UDP socket *************************************/
+int ports_sniff = q_udp_ports.size();
+
+for(int i = 0; i < ports_sniff; i++){
+
+  if((s_socket = socket(PF_INET, SOCK_RAW, IPPROTO_UDP)) < 0 ){
+    perror("ERROR : An error occured in function socket()");
+    exit(-1);
+  }
+
+  sin.sin_family = AF_INET;
+  sin.sin_addr.s_addr = inet_addr(source_ip.c_str());  //new
+  sin.sin_port = htons(60035);
+
+  din.sin_family = AF_INET;
+  din.sin_addr.s_addr = inet_addr(dest_ip.c_str());
+  din.sin_port = htons(q_udp_ports.front());
+
+
+  create_ip_header(ip, dest_ip, source_ip, UDP_PROTOCOL);
+  create_udp_packet(udp, q_udp_ports.front());
+
+  cout << q_udp_ports.front() << "/udp	 ";
+
+  q_udp_ports.pop();
+
+  if(setsockopt(s_socket, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0){
+    perror("ERROR : An error occured in setsockopt()");
+    exit(-1);
+  }
+
+  pcap_set_new_filter(dev, fp, mask, net, "icmp");
+
+  if(sendto(s_socket, buffer, ip->tot_len, 0,(struct sockaddr *)&din, sizeof(din)) < 0){
+    perror("ERROR : An error occured in sendto()");
+    exit(-1);
+  }
+
+  alarm(2);
+  signal(SIGALRM, alarm_handler);
+  pcap_loop(handle, 1, packet_handle_udp, NULL);
+
+  // pcap_freecode(fp);
+  pcap_close(handle);
+
+  close(s_socket);
+}
 
 /********************** Create TCP socket *************************************/
 
 /*  Number of ports to sniff  */
-int ports_sniff = q_tcp_ports.size();
+ports_sniff = q_tcp_ports.size();
 
 for (int i = 0; i < ports_sniff; i++) {
   // Creating TCP socket with RAW schranka
@@ -504,16 +637,17 @@ for (int i = 0; i < ports_sniff; i++) {
 
   sin.sin_family = AF_INET;
   sin.sin_addr.s_addr = inet_addr(source_ip.c_str());  //new
-  sin.sin_port = htons(60358);
+  sin.sin_port = htons(60036);
 
-  // sin.sin_addr.s_addr = inet_addr("127.0.0.1");
   //new
   din.sin_family = AF_INET;
   din.sin_addr.s_addr = inet_addr(dest_ip.c_str());
   din.sin_port = htons(q_tcp_ports.front());
 
-  create_ip_header(tcp, ip, dest_ip, source_ip);
+  create_ip_header(ip, dest_ip, source_ip, TCP_PROTOCOL);
   create_tcp_header(tcp, ip, q_tcp_ports.front());
+
+  cout << q_tcp_ports.front() << "/tcp	 ";
 
   q_tcp_ports.pop(); /* Remove used port  */
 
@@ -523,90 +657,56 @@ for (int i = 0; i < ports_sniff; i++) {
   }
 
   // create_tcp_packet(s_socket, dest_ip, domain_name, tcp, ip);
+  pcap_set_new_filter(dev, fp, mask, net, "port 60036");
 
   if(sendto(s_socket, buffer, ip->tot_len, 0,(struct sockaddr *)&din, sizeof(din)) < 0){
     perror("ERROR : An error occured in sendto()");
     exit(-1);
   }
-  else {
 
-    /* Grab a packet and start sniffing information */
-		 packet = pcap_next(handle, &header); //my
-
-    //  pcap_loop(handle, 100, handle_packets, NULL);
-    //  printf("Jacked a packet with length of [%d]\n", header.len);
-     packet = pcap_next(handle, &header); //received
-
-		/* Print its length */
-     const struct iphdr *ip_sniff;
-     ip_sniff = (struct iphdr*)(packet + 14);
-     int ip_size = IP_HL(ip_sniff)*4;
-     if(ip_sniff->protocol == IPPROTO_TCP){
-
-       const struct tcphdr *tcp_sniff;
-       tcp_sniff = (struct tcphdr*)(packet + 14 + ip_size);
-
-
-       if(tcp_sniff->ack && tcp_sniff->syn) {
-         cout << ntohs(tcp_sniff->source) << "/tcp  " << "open" << endl;
-        //  pcap_set_new_filter(handle, fp, mask, net, q_tcp_ports.front());
-         for(int i = 0; i < 7; i++) pcap_next(handle, &header); /* Filter unwanted */
-
-       }
-       else if (tcp_sniff->ack && tcp_sniff->rst) {
-         cout << ntohs(tcp_sniff->source) << "/tcp  " << "closed" << endl;
-       }
-       else {
-         printf("NO %d %d %d %d \n",tcp_sniff->ack, tcp_sniff->syn, tcp_sniff->fin, tcp_sniff->rst );
-       }
-     }
-     else {printf("NO\n" );}
-   }
-  //  sleep(1);
-   close(s_socket);
+  alarm(2);
+  signal(SIGALRM, tcp_alarm_handler);
+  pcap_loop(handle, 2, packet_handle_tcp, NULL);
+  // else {
+  //
+  //   /* Grab a packet and start sniffing information */
+	// 	 packet = pcap_next(handle, &header); //my
+  //
+  //   //  pcap_loop(handle, 100, handle_packets, NULL);
+  //   //  printf("Jacked a packet with length of [%d]\n", header.len);
+  //    packet = pcap_next(handle, &header); //received
+  //
+  //
+  //    const struct iphdr *ip_sniff;
+  //    ip_sniff = (struct iphdr*)(packet + 14);
+  //    int ip_size = IP_HL(ip_sniff)*4;
+  //    if(ip_sniff->protocol == IPPROTO_TCP){
+  //
+  //      const struct tcphdr *tcp_sniff;
+  //      tcp_sniff = (struct tcphdr*)(packet + 14 + ip_size);
+  //
+  //
+  //      if(tcp_sniff->ack && tcp_sniff->syn) {
+  //        cout << ntohs(tcp_sniff->source) << "/tcp  " << "open" << endl;
+  //       //  pcap_set_new_filter(handle, fp, mask, net, q_tcp_ports.front());
+  //        for(int i = 0; i < 7; i++) pcap_next(handle, &header); /* Filter unwanted */
+  //
+  //      }
+  //      else if (tcp_sniff->ack && tcp_sniff->rst) {
+  //        cout << ntohs(tcp_sniff->source) << "/tcp  " << "closed" << endl;
+  //      }
+  //      else {
+  //        printf("NO %d %d %d %d \n",tcp_sniff->ack, tcp_sniff->syn, tcp_sniff->fin, tcp_sniff->rst );
+  //      }
+  //    }
+  //    else {printf("NO\n" );}
+  //  }
+  pcap_close(handle);
+  close(s_socket);
  }
 
-/*
-  port_numb = udp_ports.front();
-  int s = 80;
-  int b = 60358;
-
-  ip->ihl = 5;
-  ip->version = 4;
-  ip->tos = 16;
-  ip->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr);
-  ip->id = htons(54321);
-  ip->frag_off = 0;
-  ip->ttl = 64;
-  ip->protocol = 6; // TCP
-  ip->check = 0; // Done by kernel
-  ip->saddr = inet_addr("192.168.0.10");
-  ip->daddr = inet_addr("147.229.9.23");
-
-  create_udp_packet(udp, b, s);
-
-  if((s_socket = socket(PF_INET, SOCK_RAW, IPPROTO_UDP)) < 0 ){
-    perror("ERROR : An error occured in function socket()");
-    exit(-1);
-  }
-
-  if(setsockopt(s_socket, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0){
-    perror("ERROR : An error occured in setsockopt()");
-    exit(-1);
-  }
-
-  if(sendto(s_socket, buffer, ip->tot_len, 0,(struct sockaddr *)&sin, sizeof(sin)) < 0){
-    perror("ERROR : An error occured in sendto()");
-    exit(-1);
-  }
-  else{
-    printf("OK\n");
-  }
-
-  sleep(1);
-  close(s_socket);*/
 
   /* And close the session */
-  pcap_close(handle);
+  // pcap_close(handle);
   return 0;
 }
