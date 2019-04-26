@@ -6,7 +6,7 @@ Port scanner is using two techniques for scanning. First one is TCP-SYN scan and
   
 # Usage pattern  
 
-./ipk-scan {-i <interface>} -pu <port-ranges> -pt <port-ranges> [<domain-name> | <IP-address>]\
+	./ipk-scan {-i <interface>} -pu <port-ranges> -pt <port-ranges> [<domain-name> | <IP-address>]\
 
 	-i    user selected interface name
 	-pu   specifies udp ports for scan
